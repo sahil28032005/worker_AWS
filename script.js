@@ -1,24 +1,32 @@
 const { exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const AWS = require('aws-sdk');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 const mime = require('mime-types');
 require('dotenv').config();
 const { Kafka } = require('kafkajs');
 
-//getting kafka broker information securely from managers \
+// SSM client configuration
+const ssmClient = new SSMClient({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESSKEY,
+        secretAccessKey: process.env.AWS_SECRETACCESSKEY
+    }
+});
+
+//getting kafka broker information securely from managers
 async function getKafkaBroker() {
-    const ssm = new AWS.SSM();
     const params = {
         Name: 'KAFKA_BROKER',
         WithDecryption: true
     };
 
     try {
-        const data = await ssm.getParameter(params).promise();
-        return data.Parameter.Value; // Kafka broker IP:port
-
+        const command = new GetParameterCommand(params);
+        const response = await ssmClient.send(command);
+        return response.Parameter.Value; // Kafka broker IP:port
     } catch (e) {
         console.error('Error getting Kafka broker information:', e);
         return null;
@@ -45,9 +53,8 @@ const s3Client = new S3Client({
 const PROJECT_ID = process.env.PROJECT_ID;
 const DEPLOYMENT_ID = process.env.DEPLOYMENT_ID;
 const GIT_URI = process.env.GIT_URI;
-
-
-
+const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || 'user-build-codes';
+const MAX_CONCURRENT_UPLOADS = parseInt(process.env.MAX_CONCURRENT_UPLOADS || '5', 10);
 
 // Log publisher function
 async function publishLog(log, producer, logLevel = 'info', fileDetails = {}) {
@@ -70,7 +77,7 @@ async function publishLog(log, producer, logLevel = 'info', fileDetails = {}) {
 }
 
 //helper method to upload single file to s3
-async function uploadToS3(filePath, s3Key, producer) {
+async function uploadToS3(filePath, s3Key, producer, maxRetries = 3) {
     const fileSize = fs.statSync(filePath).size;
     const readableFileSize = formatFileSize(fileSize);
     const startTime = Date.now();
@@ -83,41 +90,52 @@ async function uploadToS3(filePath, s3Key, producer) {
     });
 
     const command = new PutObjectCommand({
-        Bucket: 'user-build-codes',
+        Bucket: S3_BUCKET_NAME,
         Key: s3Key,
         Body: fs.createReadStream(filePath),
         ContentType: mime.lookup(filePath) || 'application/octet-stream'
     });
 
-    try {
-        await s3Client.send(command);
-        const endTime = Date.now();
-        const timeTaken = (endTime - startTime) / 1000;
+    let retries = 0;
+    while (retries <= maxRetries) {
+        try {
+            await s3Client.send(command);
+            const endTime = Date.now();
+            const timeTaken = (endTime - startTime) / 1000;
 
-        console.log('Uploaded', path.basename(filePath));
-        const logMessage = {
-            timestamp: new Date().toISOString(),
-            eventType: 'upload_completed',
-            fileName: path.basename(filePath),
-            fileSize: readableFileSize,
-            fileSizeInBytes: fileSize,
-            timeTaken: timeTaken,
-            status: 'success',
-            message: `File uploaded successfully to S3`
-        };
+            console.log('Uploaded', path.basename(filePath));
+            const logMessage = {
+                timestamp: new Date().toISOString(),
+                eventType: 'upload_completed',
+                fileName: path.basename(filePath),
+                fileSize: readableFileSize,
+                fileSizeInBytes: fileSize,
+                timeTaken: timeTaken,
+                status: 'success',
+                message: `File uploaded successfully to S3`
+            };
 
-        publishLog('actual data', producer, 'info', logMessage);
-        return true;
-    }
-    catch (error) {
-        console.log('Error uploading file:', error.message);
-        publishLog(`Error uploading ${path.basename(filePath)}: ${error.message}`, producer, 'error');
-        return false;
+            publishLog('actual data', producer, 'info', logMessage);
+            return true;
+        }
+        catch (error) {
+            retries++;
+            if (retries > maxRetries) {
+                console.log(`Error uploading file after ${maxRetries} attempts:`, error.message);
+                publishLog(`Error uploading ${path.basename(filePath)}: ${error.message}`, producer, 'error');
+                return false;
+            }
+            
+            // Exponential backoff
+            const delay = Math.pow(2, retries) * 100;
+            console.log(`Retry attempt ${retries}/${maxRetries} for ${path.basename(filePath)} after ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
     }
 }
 
 //helper function to upload directory as recursive manner
-async function uploadDirectory(dirPath, s3KeyPrefix, producer, maxConcurrent = 5) {
+async function uploadDirectory(dirPath, s3KeyPrefix, producer, maxConcurrent = MAX_CONCURRENT_UPLOADS) {
     const files = [];
     // Directories to exclude from upload
     const excludeDirs = ['node_modules', '.git', '.github', '.vscode', 'coverage'];
@@ -201,9 +219,20 @@ function detectBuildFolder(projectDir) {
 
 // Main function
 async function init() {
+    // Get Kafka broker from SSM if not provided in environment
+    let kafkaBroker = process.env.KAFKA_BROKER;
+    if (!kafkaBroker) {
+        console.log("No Kafka broker found in environment, attempting to fetch from SSM...");
+        kafkaBroker = await getKafkaBroker();
+        if (!kafkaBroker) {
+            console.error("Failed to get Kafka broker information. Exiting.");
+            process.exit(1);
+        }
+    }
+    
     const kafka = new Kafka({
         clientId: `docker-build-server-${DEPLOYMENT_ID}`,
-        brokers: [`${process.env.KAFKA_BROKER}`],
+        brokers: [kafkaBroker],
     });
     // Kafka producer setup
     const producer = kafka.producer();
