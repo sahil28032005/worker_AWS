@@ -35,5 +35,5 @@ node ./script.js
 
 # Signal successful completion
 echo "All tasks completed. Exiting ECS container."
-exit 0
+# exit 0
 # tail -f /dev/null
