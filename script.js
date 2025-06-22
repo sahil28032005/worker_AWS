@@ -69,13 +69,127 @@ async function publishLog(log, producer, logLevel = 'info', fileDetails = {}) {
     });
 }
 
+//helper method to upload single file to s3
+async function uploadToS3(filePath, s3Key, producer) {
+    const fileSize = fs.statSync(filePath).size;
+    const readableFileSize = formatFileSize(fileSize);
+    const startTime = Date.now();
+
+    console.log('Uploading', filePath, 'to', s3Key);
+    publishLog(`Uploading ${path.basename(filePath)}`, producer, 'PROCESSING', {
+        fileName: path.basename(filePath),
+        fileSize: readableFileSize,
+        fileSizeInBytes: fileSize,
+    });
+
+    const command = new PutObjectCommand({
+        Bucket: 'user-build-codes',
+        Key: s3Key,
+        Body: fs.createReadStream(filePath),
+        ContentType: mime.lookup(filePath) || 'application/octet-stream'
+    });
+
+    try {
+        await s3Client.send(command);
+        const endTime = Date.now();
+        const timeTaken = (endTime - startTime) / 1000;
+
+        console.log('Uploaded', path.basename(filePath));
+        const logMessage = {
+            timestamp: new Date().toISOString(),
+            eventType: 'upload_completed',
+            fileName: path.basename(filePath),
+            fileSize: readableFileSize,
+            fileSizeInBytes: fileSize,
+            timeTaken: timeTaken,
+            status: 'success',
+            message: `File uploaded successfully to S3`
+        };
+
+        publishLog('actual data', producer, 'info', logMessage);
+        return true;
+    }
+    catch (error) {
+        console.log('Error uploading file:', error.message);
+        publishLog(`Error uploading ${path.basename(filePath)}: ${error.message}`, producer, 'error');
+        return false;
+    }
+}
+
+//helper function to upload directory as recursive manner
+async function uploadDirectory(dirPath, s3KeyPrefix, producer, maxConcurrent = 5) {
+    const files = [];
+    // Directories to exclude from upload
+    const excludeDirs = ['node_modules', '.git', '.github', '.vscode', 'coverage'];
+
+    //getting all files recursively
+    function getAllFiles(dir, baseDir = '') {
+        //first read the directory
+        const entries = fs.readdirSync(dir);
+
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry);
+            const relativePath = path.join(baseDir, entry);
+            
+            // Skip excluded directories
+            if (fs.lstatSync(fullPath).isDirectory()) {
+                // Skip directories in the exclude list
+                if (excludeDirs.includes(entry)) {
+                    console.log(`Skipping excluded directory: ${fullPath}`);
+                    continue;
+                }
+                getAllFiles(fullPath, relativePath);
+            }
+            else {
+                files.push(
+                    {
+                        filePath: fullPath,
+                        relativePath: relativePath,
+                    }
+                );
+            }
+        }
+    }
+    
+    //initial call for directory
+    getAllFiles(dirPath);
+    publishLog(`Found ${files.length} files to upload in ${dirPath}`, producer, 'info');
+
+    // Skip if no files found
+    if (files.length === 0) {
+        publishLog(`No files to upload in ${dirPath}`, producer, 'warning');
+        return true;
+    }
+
+    //start uploading files in batches for better performance
+    const results = [];
+    for (let i = 0; i < files.length; i += maxConcurrent) {
+        const batch = files.slice(i, i + maxConcurrent);
+        const batchPromises = batch.map(file => uploadToS3(
+            file.filePath,
+            `${s3KeyPrefix}/${file.relativePath.replace(/\\/g, '/')}`,
+            producer
+        ));
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
+    }
+    const successCount = results.filter(r => r).length;
+    publishLog(`Uploaded ${successCount}/${files.length} files from ${dirPath}`,
+        producer,
+        successCount === files.length ? 'success' : 'warning'
+    );
+
+    return successCount === files.length;
+}
+
+
 //helper function to detect output dir
 function detectBuildFolder(projectDir) {
     const possibleFolders = ['build', 'dist', '.next', 'out', 'public']; // Common build folders
     for (const folder of possibleFolders) {
         const fullPath = path.join(projectDir, folder);
         console.log('Checking folder:', fullPath);
-        
+
         if (fs.existsSync(fullPath) && fs.lstatSync(fullPath).isDirectory()) {
             return fullPath;
         }
@@ -134,67 +248,31 @@ async function init() {
         console.log(`Detected build folder: ${buildFolder}`);
         publishLog(`Detected build folder: ${buildFolder}`, producer, 'info');
 
-        const distFolderContents = fs.readdirSync(buildFolder, { recursive: true });
+        //first start uploading buld files
+        publishLog('Starting to upload build files...', producer, 'info');
+        const buildSuccess = await uploadDirectory(
+            buildFolder,
+            `__outputs/${PROJECT_ID}/build`,
+            producer
+        );
 
-        publishLog('Starting to upload files...', producer, 'info');
+        // Upload user code (source files)
+        publishLog('Starting to upload user code...', producer, 'info');
+        const userCodeSuccess = await uploadDirectory(
+            projectDir,
+            `__outputs/${PROJECT_ID}/source`,
+            producer
+        );
 
-        for (const file of distFolderContents) {
-            const filePath = path.join(buildFolder, file);
-            if (fs.lstatSync(filePath).isDirectory()) continue;
-            const fileSize = fs.statSync(filePath).size;
-            const readableFileSize = formatFileSize(fileSize);
-            const startTime = Date.now();
-
-            console.log('Uploading', filePath);
-            publishLog(`Uploading ${file}`, producer, 'PROCESSING', {
-                fileName: file,
-                fileSize: readableFileSize,
-                fileSizeInBytes: fileSize,
-            });
-
-
-
-            const command = new PutObjectCommand({
-                Bucket: 'user-build-codes',
-                Key: `__outputs/${PROJECT_ID}/${file}`,
-                Body: fs.createReadStream(filePath),
-                ContentType: mime.lookup(filePath)
-            });
-
-            try {
-                await s3Client.send(command);
-                const endTime = Date.now();
-                const timeTaken = (endTime - startTime) / 1000;
-
-                console.log('Uploaded', file);
-                // publishLog(`Uploaded ${file}`, 'success', {
-                //     file_name: file,
-                //     file_size: readableFileSize,
-                //     file_size_in_bytes: fileSize,
-                //     time_taken: timeTaken,
-                // });
-
-                const logMessage = {
-                    timestamp: new Date().toISOString(),
-                    eventType: 'upload_completed',
-                    fileName: file,
-                    fileSize: readableFileSize,
-                    fileSizeInBytes: fileSize,
-                    timeTaken: timeTaken,
-                    status: 'success',
-                    message: `File uploaded successfully to S3`
-                };
-
-                publishLog('actual data', producer, 'info', logMessage);
-            } catch (error) {
-                console.log('Error uploading file:', error.message);
-                publishLog(`Error uploading ${file}: ${error.message}`, producer, 'error');
-            }
+        if (buildSuccess && userCodeSuccess) {
+            console.log('All files uploaded successfully!');
+            publishLog('All files uploaded successfully!', producer, 'success');
+        } else {
+            console.log('Some files failed to upload.');
+            publishLog('Some files failed to upload.', producer, 'warning');
         }
 
-        console.log('All files uploaded!');
-        publishLog('All files uploaded!', producer, 'success');
-        process.exit(0);
+        process.exit(buildSuccess && userCodeSuccess ? 0 : 1);
     });
 }
 
