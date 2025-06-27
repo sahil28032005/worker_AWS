@@ -16,6 +16,101 @@ const ssmClient = new SSMClient({
     }
 });
 
+// Function to update package.json homepage
+function updatePackageJsonHomepage(projectDir) {
+    try {
+        const packageJsonPath = path.join(projectDir, 'package.json');
+        if (!fs.existsSync(packageJsonPath)) {
+            console.log('No package.json found, skipping homepage update');
+            return;
+        }
+
+        console.log(`Updating homepage in ${packageJsonPath}`);
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        
+        // Set the homepage to the correct S3 path - IMPORTANT: changed to match the file upload structure
+        const homepagePath = `/__outputs/${PROJECT_ID}`;
+        packageJson.homepage = homepagePath;
+        
+        // Write the updated package.json
+        fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2));
+        console.log(`Set homepage to: ${homepagePath}`);
+    } catch (error) {
+        console.error('Error updating package.json homepage:', error);
+    }
+}
+
+// Function to create or update vite.config.js for Vite-based apps
+function updateViteConfig(projectDir) {
+    try {
+        // Check if this might be a Vite project
+        const packageJsonPath = path.join(projectDir, 'package.json');
+        if (!fs.existsSync(packageJsonPath)) {
+            return false;
+        }
+        
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+        
+        // Check if vite is a dependency
+        const isViteProject = dependencies && (dependencies.vite || dependencies['@vitejs/plugin-react']);
+        
+        if (!isViteProject) {
+            console.log('Not a Vite project, skipping vite.config.js update');
+            return false;
+        }
+        
+        console.log('Detected Vite project, updating vite.config.js');
+        
+        // Path for the base URL - IMPORTANT: changed to match the file upload structure
+        const basePath = `/__outputs/${PROJECT_ID}/`;
+        
+        // Check if vite.config.js exists
+        const viteConfigPath = path.join(projectDir, 'vite.config.js');
+        
+        if (fs.existsSync(viteConfigPath)) {
+            // Read existing config
+            const existingConfig = fs.readFileSync(viteConfigPath, 'utf8');
+            
+            // Check if base is already set
+            if (existingConfig.includes('base:') && !existingConfig.includes(`base: '${basePath}'`)) {
+                // Replace existing base setting
+                const updatedConfig = existingConfig.replace(
+                    /base:\s*['"][^'"]*['"]/,
+                    `base: '${basePath}'`
+                );
+                fs.writeFileSync(viteConfigPath, updatedConfig);
+            } else if (!existingConfig.includes('base:')) {
+                // Add base setting to existing config
+                const updatedConfig = existingConfig.replace(
+                    /export default defineConfig\(\{/,
+                    `export default defineConfig({\n  base: '${basePath}',`
+                );
+                fs.writeFileSync(viteConfigPath, updatedConfig);
+            }
+        } else {
+            // Create new vite.config.js
+            const newConfig = `
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  base: '${basePath}',
+  plugins: [react()],
+})
+`;
+            fs.writeFileSync(viteConfigPath, newConfig);
+        }
+        
+        console.log(`Updated vite.config.js with base: '${basePath}'`);
+        return true;
+    } catch (error) {
+        console.error('Error updating vite.config.js:', error);
+        return false;
+    }
+}
+
 //getting kafka broker information securely from managers
 async function getKafkaBroker() {
     const params = {
@@ -125,7 +220,7 @@ async function uploadToS3(filePath, s3Key, producer, maxRetries = 3) {
                 publishLog(`Error uploading ${path.basename(filePath)}: ${error.message}`, producer, 'error');
                 return false;
             }
-            
+
             // Exponential backoff
             const delay = Math.pow(2, retries) * 100;
             console.log(`Retry attempt ${retries}/${maxRetries} for ${path.basename(filePath)} after ${delay}ms`);
@@ -183,11 +278,11 @@ async function uploadDirectory(dirPath, s3KeyPrefix, producer, maxConcurrent = M
     const results = [];
     for (let i = 0; i < files.length; i += maxConcurrent) {
         const batch = files.slice(i, i + maxConcurrent);
-        const batchPromises = batch.map(file => uploadToS3(
-            file.filePath,
-            `${s3KeyPrefix}/${file.relativePath.replace(/\\/g, '/')}`,
-            producer
-        ));
+        const batchPromises = batch.map(file => {
+            // Use the same key structure for all files to match your previous working approach
+            const s3Key = `${s3KeyPrefix}/${file.relativePath.replace(/\\/g, '/')}`;
+            return uploadToS3(file.filePath, s3Key, producer);
+        });
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
     }
@@ -229,7 +324,7 @@ async function init() {
             process.exit(1);
         }
     }
-    
+
     const kafka = new Kafka({
         clientId: `docker-build-server-${DEPLOYMENT_ID}`,
         brokers: [kafkaBroker],
@@ -244,6 +339,15 @@ async function init() {
     publishLog('Build Started...', producer, 'info');
 
     const projectDir = path.join(__dirname, 'output');
+
+    // Update package.json homepage for React apps
+    updatePackageJsonHomepage(projectDir);
+    publishLog('Updated package.json with correct homepage path', producer, 'info');
+
+    // Update vite.config.js for Vite-based apps
+    updateViteConfig(projectDir);
+    publishLog('Updated vite.config.js with correct base path', producer, 'info');
+
     // Get build command from environment variable
     const buildCommand = process.env.BUILD_COMMAND || 'npm install && npm run build'; // Default if not set
     console.log(`Executing build command: ${buildCommand}`);
@@ -281,7 +385,7 @@ async function init() {
         publishLog('Starting to upload build files...', producer, 'info');
         const buildSuccess = await uploadDirectory(
             buildFolder,
-            `__outputs/${PROJECT_ID}/build`,
+            `__outputs/${PROJECT_ID}`,  // Removed "/build" to match the structure in your previous working code
             producer
         );
 
