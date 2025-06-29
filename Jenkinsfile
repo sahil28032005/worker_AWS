@@ -20,41 +20,41 @@ pipeline {
         
         stage('Install Dependencies') {
             steps {
-                sh 'npm install'
+                bat 'npm install'
             }
         }
         
         stage('Lint') {
             steps {
-                sh 'npm run lint || true'
+                bat 'npm run lint || exit /b 0'
             }
         }
         
         stage('Test') {
             steps {
-                sh 'npm test || echo "No tests configured"'
+                bat 'npm test || echo "No tests configured"'
             }
         }
         
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t worker-aws:${BUILD_NUMBER} -f Dockerfile.builder .'
+                bat 'docker build -t worker-aws:%BUILD_NUMBER% -f Dockerfile.builder .'
             }
         }
         
         stage('Run Integration Test') {
             steps {
-                sh '''
-                    docker run --rm \
-                    -e AWS_REGION=${AWS_REGION} \
-                    -e AWS_ACCESSKEY=${AWS_ACCESSKEY} \
-                    -e AWS_SECRETACCESSKEY=${AWS_SECRETACCESSKEY} \
-                    -e S3_BUCKET_NAME=${S3_BUCKET_NAME} \
-                    -e KAFKA_BROKER=${KAFKA_BROKER} \
-                    -e PROJECT_ID=${PROJECT_ID} \
-                    -e DEPLOYMENT_ID=${DEPLOYMENT_ID} \
-                    -e BUILD_COMMAND="npm install && echo 'Build simulation successful'" \
-                    worker-aws:${BUILD_NUMBER}
+                bat '''
+                    docker run --rm ^
+                    -e AWS_REGION=%AWS_REGION% ^
+                    -e AWS_ACCESSKEY=%AWS_ACCESSKEY% ^
+                    -e AWS_SECRETACCESSKEY=%AWS_SECRETACCESSKEY% ^
+                    -e S3_BUCKET_NAME=%S3_BUCKET_NAME% ^
+                    -e KAFKA_BROKER=%KAFKA_BROKER% ^
+                    -e PROJECT_ID=%PROJECT_ID% ^
+                    -e DEPLOYMENT_ID=%DEPLOYMENT_ID% ^
+                    -e BUILD_COMMAND="npm install && echo 'Build simulation successful'" ^
+                    worker-aws:%BUILD_NUMBER%
                 '''
             }
         }
@@ -64,7 +64,7 @@ pipeline {
                 branch 'main'
             }
             steps {
-                sh 'echo "Deployment would happen here"'
+                bat 'echo "Deployment would happen here"'
                 // Add actual deployment commands here
             }
         }
